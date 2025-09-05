@@ -1,13 +1,11 @@
 from cobra.io import read_sbml_model, write_sbml_model
 import pandas as pd
-import pickle
 import logging
 from copy import deepcopy
-import pdb
-import gurobipy
+
+
 import os
 import sys
-import re
 from cobra import Reaction
 
 # Determine the current file's directory and the project root.
