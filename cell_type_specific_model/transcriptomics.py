@@ -186,7 +186,7 @@ def extract_pairs(model_path):
     """
     tree = ET.parse(model_path)
     root = tree.getroot()
-    symbol_and_ensembl = {}
+    symbol_and_ensebl = {}
 
     # Extract pairs of HGNC symbols and Ensembl IDs from an XML file
 
@@ -212,32 +212,32 @@ def extract_pairs(model_path):
 
         # If both HGNC and Ensembl ID are found, add them to the dictionary.
         if hgnc_symbol and ensg:
-            if hgnc_symbol in symbol_and_ensembl:
+            if hgnc_symbol in symbol_and_ensebl:
                 # If duplicate symbol, check whether it is the same Ensembl ID.
-                if symbol_and_ensembl[hgnc_symbol] == ensg:
+                if symbol_and_ensebl[hgnc_symbol] == ensg:
                     continue
                 # Convert to list if needed and add the new Ensembl ID.
-                if not isinstance(symbol_and_ensembl[hgnc_symbol], list):
-                    symbol_and_ensembl[hgnc_symbol] = [symbol_and_ensembl[hgnc_symbol]]
-                symbol_and_ensembl[hgnc_symbol].append(ensg)
+                if not isinstance(symbol_and_ensebl[hgnc_symbol], list):
+                    symbol_and_ensebl[hgnc_symbol] = [symbol_and_ensebl[hgnc_symbol]]
+                symbol_and_ensebl[hgnc_symbol].append(ensg)
             else:
-                symbol_and_ensembl[hgnc_symbol] = ensg
+                symbol_and_ensebl[hgnc_symbol] = ensg
 
-    return symbol_and_ensembl
+    return symbol_and_ensebl
 
 
-def sgpr_to_ensembl(model, symbol_and_ensembl):
+def sgpr_to_ensembl(model, symbol_and_ensebl):
     """
     Converts GPR rules in the model from gene symbols/indices to Ensembl IDs using
     the provided mapping.
 
     For each reaction, the function scans the gene reaction rule for gene tokens
     (ignoring logical operators). It then replaces these tokens with the corresponding
-    Ensembl IDs from the symbol_and_ensembl dictionary. Unmatched genes are reported.
+    Ensembl IDs from the symbol_and_ensebl dictionary. Unmatched genes are reported.
 
     Parameters:
         model (cobra.Model): The metabolic model.
-        symbol_and_ensembl (dict): Dictionary mapping HGNC symbols to Ensembl IDs.
+        symbol_and_ensebl (dict): Dictionary mapping HGNC symbols to Ensembl IDs.
 
     Returns:
         list: A list of updated GPR rules with gene tokens replaced by Ensembl IDs.
@@ -258,19 +258,19 @@ def sgpr_to_ensembl(model, symbol_and_ensembl):
         genes = [gene for gene in genes if gene not in ["or", "and"]]
         for gene in genes:
             # Check if gene is already an Ensembl ID or is present in the mapping.
-            if gene in symbol_and_ensembl.values():
+            if gene in symbol_and_ensebl.values():
                 ensg_id = gene
             elif gene.startswith("ENSG"):
                 ensg_id = gene  # Already in Ensembl format.
-            elif gene in symbol_and_ensembl.keys():
+            elif gene in symbol_and_ensebl.keys():
                 # If multiple Ensembl IDs exist, choose the first.
-                if isinstance(symbol_and_ensembl[gene], list):
+                if isinstance(symbol_and_ensebl[gene], list):
                     print(
-                        f"Gene {gene} has multiple Ensembl IDs: {symbol_and_ensembl[gene]}"
+                        f"Gene {gene} has multiple Ensembl IDs: {symbol_and_ensebl[gene]}"
                     )
-                    ensg_id = symbol_and_ensembl[gene][0]
+                    ensg_id = symbol_and_ensebl[gene][0]
                 else:
-                    ensg_id = symbol_and_ensembl[gene]
+                    ensg_id = symbol_and_ensebl[gene]
             else:
                 ensg_id = ""
                 print(f"Gene {gene} not found in the Ensembl model")
@@ -580,38 +580,40 @@ def main():
     lung_data = os.path.join(
         project_root, "files", "gene_reads_v10_lung.gct"
     )  # GTEx expression data
+    expression_rxns_path = os.path.join(project_root, "files", "expressionRxns.csv")
+
+    # Load the model
     model = read_sbml_model(model_path)
 
-    model = biomass_fix(model)
-    # Extract gene symbol and Ensembl ID pairs from the model XML.
-    symbol_and_ensembl = extract_pairs(model_path)
-    # Convert sGPR rules to use Ensembl IDs.
-    new_rules2 = sgpr_to_ensembl(model, symbol_and_ensembl)
-    # Process the expression data to generate evaluated expression values.
-    rules_samples, expressionRxns = process_expression_data(new_rules2, lung_data)
+    if os.path.exists(expression_rxns_path):
+        print(
+            f"ExpressionRxns file already exists at {expression_rxns_path}. Loading data..."
+        )
+        expressionRxns = pd.read_csv(expression_rxns_path, header=None).values
+    else:
+        model = biomass_fix(model)
+        # Extract gene symbol and Ensembl ID pairs from the model XML.
+        symbol_and_ensembl = extract_pairs(model_path)
+        # Convert sGPR rules to use Ensembl IDs.
+        new_rules2 = sgpr_to_ensembl(model, symbol_and_ensembl)
+        # Process the expression data to generate evaluated expression values.
+        rules_samples, expressionRxns = process_expression_data(new_rules2, lung_data)
 
-    # Convert rules_samples to a more memory-efficient data type
-    rules_samples = np.array(
-        rules_samples, dtype=object
-    )  # Use dtype=object for mixed types
-    expressionRxns = np.array(
-        expressionRxns, dtype=np.float32
-    )  # Use float32 for smaller memory footprint
+        # Convert rules_samples to a more memory-efficient data type
+        rules_samples = np.array(
+            rules_samples, dtype=object
+        )  # Use dtype=object for mixed types
+        expressionRxns = np.array(
+            expressionRxns, dtype=np.float32
+        )  # Use float32 for smaller memory footprint
 
-    expressionRxns_df = pd.DataFrame(expressionRxns)
-    expression_rxns_path = os.path.join(project_root, "files", "expressionRxns.csv")
-    expressionRxns_df.to_csv(expression_rxns_path, index=False, header=False)
+        expressionRxns_df = pd.DataFrame(expressionRxns)
+        expressionRxns_df.to_csv(expression_rxns_path, index=False, header=False)
 
     # Exchange reactions common between the general model and the cell type specific model (obtained from match_exch_rxns script)
-    # exchange_rs = (
-    #     pd.read_csv(os.path.join(project_root, "files", "common_rs.txt"), header=None)
-    #     .values.flatten()
-    #     .tolist()
-    # )
     exchange_rs = [rxn.id for rxn in model.reactions if rxn.boundary]
 
     # Create a copy for flux computations so that the original model remains unmodified
-    # model_flux = model.copy()
     model_flux = copy.deepcopy(model)
     all_solutions = gimme(model_flux, expressionRxns, exchange_rs, num_workers=4)
 
