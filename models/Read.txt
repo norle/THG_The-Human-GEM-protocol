@@ -1,4 +1,4 @@
-Human-GEM_2022-06-21.xml: Reference human metabolism (Human1) model 
+Human-GEM1_19.xml: Reference human metabolism (Human1) model 
 Human Database.xml: Database developed 
 THG-2023-02-25.xml: Input THG, developed by merge_metabolic_netowrks_and_network_consistency.py
 THG-beta1: Model with all compartments, before filtering (output from build_model)

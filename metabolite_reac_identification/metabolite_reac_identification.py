@@ -1,4 +1,3 @@
-
 import cobra.io
 import numpy as np
 import re
@@ -17,7 +16,7 @@ from functions.function_metabolite_identification import *
 from functions.function_reac_identification import *
 from functions.function_annotate_cobra_model import *
 
-model = os.path.join(project_root, "models", "Human-GEM_2022-06-21.xml")
+model = os.path.join(project_root, "models", "Human-GEM1_19.xml")
 database = os.path.join(project_root, "models", "Human Database.xml")
 
 cobra_model = cobra.io.read_sbml_model(model)
@@ -32,9 +31,9 @@ met_annotation = process_annotation()
 
 # Reactions
 
-reac = process_reac(model, '[A-Z]+[0-9]+[a-z]+[0-9]*', 'MAM02040', 'MAM02039')
+reac = process_reac(model, "[A-Z]+[0-9]+[a-z]+[0-9]*", "MAM02040", "MAM02039")
 reac = replace_met_id_by_met_kegg(reac, gather_kegg_metabolites(model))
-reac_y = process_reac(database, '([A-Z][0-9]+_?[a-z]+[0-9]*)', 'C00080', 'C00001')
+reac_y = process_reac(database, "([A-Z][0-9]+_?[a-z]+[0-9]*)", "C00080", "C00001")
 jaccard = execute_jaccard(reac_y, reac)
 reac_annotation = process_jaccard(reac_y, reac, jaccard)
 
