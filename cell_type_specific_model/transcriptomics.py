@@ -619,7 +619,7 @@ def main():
 
     # Tailor the model based on the flux solutions from the reconstruction algorithm
     output_path = os.path.join(
-        project_root, "models", "endoA_290905.xml"
+        project_root, "models", "endoA_290925.xml"
     )  # Output path for the tailored model
 
     model_reduce(model, all_solutions, output_path)

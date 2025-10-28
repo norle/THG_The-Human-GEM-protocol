@@ -19,6 +19,247 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 
+# === Global per-process worker state (initialized once per worker) ===
+WORKER_MODEL = None
+WORKER_REACTION_IDS = None
+WORKER_METABOLITE_IDS = None
+WORKER_S = None
+WORKER_LB = None
+WORKER_UB = None
+WORKER_SPLIT_MAPPING = None
+WORKER_ORIGINAL_RXN_IDS = None
+WORKER_OBJECTIVES = None
+WORKER_OBJ_FRAC = None
+WORKER_FLUX_THRESHOLD = None
+WORKER_DEBUG = False
+
+
+def _init_worker(
+    model_json_path,
+    split_mapping,
+    original_rxn_ids,
+    biomass_rxn_id,
+    atpase_rxn_id,
+    biomass_weight,
+    atpase_weight,
+    obj_frac,
+    flux_threshold,
+):
+    """Initializer for each process: load the modified model once and precompute matrices.
+
+    This avoids reloading/copying the model for every sample and keeps heavy data in-process.
+    """
+    global WORKER_MODEL, WORKER_REACTION_IDS, WORKER_METABOLITE_IDS, WORKER_S, WORKER_LB, WORKER_UB, WORKER_SPLIT_MAPPING, WORKER_ORIGINAL_RXN_IDS, WORKER_OBJECTIVES, WORKER_OBJ_FRAC, WORKER_FLUX_THRESHOLD, WORKER_DEBUG
+
+    # Determine if this is the first worker (for concise debug output)
+    try:
+        proc_name = multiprocessing.current_process().name
+        # Common names: 'SpawnProcess-1', 'ForkProcess-1', 'Process-1'
+        WORKER_DEBUG = proc_name.endswith("-1") or proc_name.endswith("1")
+    except Exception:
+        WORKER_DEBUG = False
+    if WORKER_DEBUG:
+        print(f"[Worker-DEBUG] Initializing worker {proc_name}")
+        print(f"[Worker-DEBUG] Loading model JSON from: {model_json_path}")
+
+    # Load model once per worker from JSON (more robust than SBML here)
+    WORKER_MODEL = cobra.io.load_json_model(model_json_path)
+    WORKER_REACTION_IDS = [rxn.id for rxn in WORKER_MODEL.reactions]
+    WORKER_METABOLITE_IDS = [met.id for met in WORKER_MODEL.metabolites]
+    WORKER_S = create_stoichiometric_matrix(WORKER_MODEL)
+    WORKER_LB = np.array(
+        [float(rxn.lower_bound) for rxn in WORKER_MODEL.reactions], dtype=np.float64
+    )
+    WORKER_UB = np.array(
+        [float(rxn.upper_bound) for rxn in WORKER_MODEL.reactions], dtype=np.float64
+    )
+    if WORKER_DEBUG:
+        print(
+            f"[Worker-DEBUG] Model loaded: {len(WORKER_REACTION_IDS)} reactions, {len(WORKER_METABOLITE_IDS)} metabolites"
+        )
+
+    # Store mappings and parameters
+    WORKER_SPLIT_MAPPING = split_mapping
+    WORKER_ORIGINAL_RXN_IDS = original_rxn_ids
+    # Compute objective indices based on reaction IDs in the loaded model
+    try:
+        biomass_idx = WORKER_REACTION_IDS.index(biomass_rxn_id)
+        atpase_idx = WORKER_REACTION_IDS.index(atpase_rxn_id)
+    except ValueError:
+        # Fallback to zero if not found; GIMME will error if invalid
+        biomass_idx = 0
+        atpase_idx = 0
+    WORKER_OBJECTIVES = [{biomass_idx: biomass_weight}, {atpase_idx: atpase_weight}]
+    WORKER_OBJ_FRAC = float(obj_frac)
+    WORKER_FLUX_THRESHOLD = float(flux_threshold)
+    if WORKER_DEBUG:
+        print(
+            f"[Worker-DEBUG] Objectives -> biomass idx: {biomass_idx}, weight: {biomass_weight}; atpase idx: {atpase_idx}, weight: {atpase_weight}"
+        )
+        print(
+            f"[Worker-DEBUG] Obj frac: {WORKER_OBJ_FRAC}, flux_threshold: {WORKER_FLUX_THRESHOLD}"
+        )
+        print("[Worker-DEBUG] Initialization complete.")
+
+
+def gimme_batch_worker(batch_indices, expression_batch):
+    """Process a batch of samples within a single worker using the preloaded model.
+
+    Parameters:
+        batch_indices (list[int]): Global sample indices for columns in expression_batch.
+        expression_batch (np.ndarray): Shape (n_rxns, len(batch_indices)).
+
+    Returns:
+        tuple[list[int], np.ndarray]: (batch_indices, solutions) where solutions has shape (n_rxns, len(batch)).
+    """
+    # Access global state
+    model_copy = WORKER_MODEL
+    reaction_ids = WORKER_REACTION_IDS
+    metabolite_ids = WORKER_METABOLITE_IDS
+    split_mapping = WORKER_SPLIT_MAPPING
+    S = WORKER_S
+    lb = WORKER_LB
+    ub = WORKER_UB
+    objectives = WORKER_OBJECTIVES
+    obj_frac = WORKER_OBJ_FRAC
+    flux_threshold = WORKER_FLUX_THRESHOLD
+    original_rxn_ids = WORKER_ORIGINAL_RXN_IDS
+
+    n_rxns, n_samples_in_batch = expression_batch.shape
+    batch_solutions = np.zeros((len(original_rxn_ids), n_samples_in_batch))
+
+    if WORKER_DEBUG:
+        try:
+            proc_name = multiprocessing.current_process().name
+        except Exception:
+            proc_name = "worker"
+        print(
+            f"[Worker-DEBUG] {proc_name} starting batch with {n_samples_in_batch} samples -> indices {batch_indices[:10]}{'...' if len(batch_indices)>10 else ''}"
+        )
+
+    for j in range(n_samples_in_batch):
+        sample_idx = batch_indices[j]
+        try:
+            # Reset solver to ensure clean state between samples
+            model_copy.solver.problem.reset()
+
+            # Build expression dict and extended scores
+            expr_dict = build_expression_dict_from_original(
+                original_rxn_ids, expression_batch[:, j]
+            )
+            scores = get_extended_scores(model_copy, expr_dict)
+            if WORKER_DEBUG:
+                active = int(np.sum((scores > flux_threshold) & (scores > -1)))
+                print(
+                    f"[Worker-DEBUG] Sample {sample_idx}: scores len={len(scores)}, active>{flux_threshold} = {active}"
+                )
+
+            # Properties and GIMME run
+            properties = GIMMEProperties(
+                exp_vector=scores,
+                obj_frac=obj_frac,
+                objectives=objectives,
+                preprocess=False,
+                flux_threshold=flux_threshold,
+                solver="GUROBI",
+                reaction_ids=reaction_ids,
+                metabolite_ids=metabolite_ids,
+            )
+            gimme_instance = GIMME(S=S, lb=lb, ub=ub, properties=properties)
+            if WORKER_DEBUG:
+                print(
+                    f"[Worker-DEBUG] Sample {sample_idx}: Running GIMME: S_shape={S.shape}, #rxns={len(reaction_ids)}, lb/ub={len(lb)}/{len(ub)}"
+                )
+            gimme_instance.run()
+            if WORKER_DEBUG:
+                print(f"[Worker-DEBUG] Sample {sample_idx}: GIMME run completed.")
+
+            # Extract solution (handle multiple formats robustly)
+            try:
+                if hasattr(gimme_instance, "sol") and hasattr(
+                    gimme_instance.sol, "__dict__"
+                ):
+                    if "_Solution__value_map" in gimme_instance.sol.__dict__:
+                        raw_solution = gimme_instance.sol.__dict__[
+                            "_Solution__value_map"
+                        ]
+                    elif hasattr(gimme_instance.sol, "value_map"):
+                        raw_solution = gimme_instance.sol.value_map
+                    elif hasattr(gimme_instance.sol, "fluxes"):
+                        raw_solution = gimme_instance.sol.fluxes
+                    else:
+                        raise AttributeError(
+                            "Could not find solution values in gimme_instance.sol"
+                        )
+                else:
+                    raise AttributeError(
+                        "Could not find sol attribute in gimme_instance"
+                    )
+            except Exception:
+                # Alternative access
+                if hasattr(gimme_instance, "gm") and hasattr(
+                    gimme_instance.gm, "solution"
+                ):
+                    raw_solution = gimme_instance.gm.solution
+                else:
+                    raise
+
+            # Normalize solution to dict with R{i}: value
+            if (
+                isinstance(raw_solution, list)
+                and raw_solution
+                and isinstance(raw_solution[0], tuple)
+            ):
+                solution = {f"R{i}": v for i, (_, v) in enumerate(raw_solution)}
+            elif isinstance(raw_solution, dict):
+                solution = raw_solution
+            else:
+                solution = {f"R{i}": float(val) for i, val in enumerate(raw_solution)}
+            if WORKER_DEBUG:
+                if isinstance(raw_solution, list):
+                    print(
+                        f"[Worker-DEBUG] Sample {sample_idx}: Solution format: list-of-tuples len={len(raw_solution)}; head={raw_solution[:3]}"
+                    )
+                elif isinstance(raw_solution, dict):
+                    sample_keys = list(solution.keys())[:5]
+                    print(
+                        f"[Worker-DEBUG] Sample {sample_idx}: Solution format: dict; sample keys={sample_keys}"
+                    )
+                else:
+                    try:
+                        l = len(raw_solution)
+                    except Exception:
+                        l = "n/a"
+                    print(
+                        f"[Worker-DEBUG] Sample {sample_idx}: Solution format: array-like; len={l}"
+                    )
+
+            # Recombine to original order using existing helper
+            net_solution = recombine_solution(
+                solution, original_rxn_ids, split_mapping, reaction_ids
+            )
+            batch_solutions[:, j] = net_solution
+            if WORKER_DEBUG:
+                nz = int(np.count_nonzero(net_solution))
+                print(
+                    f"[Worker-DEBUG] Sample {sample_idx}: Recombined net_solution: nnz={nz}, min={np.min(net_solution):.4g}, max={np.max(net_solution):.4g}"
+                )
+
+        except Exception as e:
+            # On failure, fill zeros for this sample
+            batch_solutions[:, j] = 0.0
+            print(f"Error in batch worker for sample {sample_idx}: {e}")
+            if WORKER_DEBUG:
+                try:
+                    import traceback
+
+                    traceback.print_exc()
+                except Exception:
+                    pass
+
+    return batch_indices, batch_solutions
+
+
 def build_expression_dict_from_original(original_rxn_ids, expression_rxns_sample):
     """
     Build a dictionary mapping each original reaction ID to its corresponding
@@ -225,41 +466,70 @@ def recombine_solution(
     solution, original_rxn_ids, split_mapping, reaction_ids_modified
 ):
     """
-    Recombine the flux solution from the modified model (with default names "R0", "R1", …)
-    into a net flux vector for the original reaction order.
-
-    For split reactions (present in split_mapping), the net flux is:
-       net_flux = flux(forward reaction) - flux(reverse reaction)
-    For non-split reactions, the flux is directly taken from the solution.
+    Simplified recombine function that maps flux values back to original reaction order.
 
     Parameters:
         solution (dict): Flux solution with keys like "R0", "R1", etc.
         original_rxn_ids (list): The original reaction IDs.
         split_mapping (dict): Mapping from original reaction IDs to (forward_rxn_id, reverse_rxn_id).
-        reaction_ids_modified (list): The modified reaction names (e.g. "R0", "R1", …).
+        reaction_ids_modified (list): The modified reaction names in order.
 
     Returns:
         np.array: Net flux values in the order of original_rxn_ids.
     """
-    # Build a lookup: modified reaction id -> its index in reaction_ids_modified
-    mod_index = {rxn: i for i, rxn in enumerate(reaction_ids_modified)}
+    # Convert solution to list if it's a dict with R0, R1, etc. keys
+    if isinstance(solution, dict) and "R0" in solution:
+        solution_values = [
+            solution.get(f"R{i}", 0.0) for i in range(len(reaction_ids_modified))
+        ]
+    elif isinstance(solution, dict):
+        # Convert other dict formats to list
+        solution_values = list(solution.values())
+    else:
+        # Assume it's already a list/array
+        solution_values = (
+            list(solution) if hasattr(solution, "__iter__") else [solution]
+        )
+
+    # Ensure we have enough values
+    while len(solution_values) < len(reaction_ids_modified):
+        solution_values.append(0.0)
+
     net_solution = []
-    for idx, orig_rxn in enumerate(original_rxn_ids):
+
+    for orig_rxn in original_rxn_ids:
         if orig_rxn in split_mapping:
+            # Handle split reactions: net_flux = forward - reverse
             fwd_rxn, rev_rxn = split_mapping[orig_rxn]
-            fwd_idx = mod_index.get(fwd_rxn)
-            rev_idx = mod_index.get(rev_rxn)
-            fwd_flux = (
-                solution.get("R" + str(fwd_idx), 0.0) if fwd_idx is not None else 0.0
-            )
-            rev_flux = (
-                solution.get("R" + str(rev_idx), 0.0) if rev_idx is not None else 0.0
-            )
+            try:
+                fwd_idx = reaction_ids_modified.index(fwd_rxn)
+                fwd_flux = (
+                    solution_values[fwd_idx] if fwd_idx < len(solution_values) else 0.0
+                )
+            except ValueError:
+                fwd_flux = 0.0
+
+            try:
+                rev_idx = reaction_ids_modified.index(rev_rxn)
+                rev_flux = (
+                    solution_values[rev_idx] if rev_idx < len(solution_values) else 0.0
+                )
+            except ValueError:
+                rev_flux = 0.0
+
             net_flux = fwd_flux - rev_flux
         else:
-            # For non-split reactions, use the index in the original reaction order.
-            net_flux = solution.get("R" + str(idx), 0.0)
+            # Non-split reaction: find it in the modified list
+            try:
+                rxn_idx = reaction_ids_modified.index(orig_rxn)
+                net_flux = (
+                    solution_values[rxn_idx] if rxn_idx < len(solution_values) else 0.0
+                )
+            except ValueError:
+                net_flux = 0.0
+
         net_solution.append(net_flux)
+
     return np.array(net_solution)
 
 
@@ -489,11 +759,11 @@ def gimme_worker(
                 gimme_instance.sol, "__dict__"
             ):
                 if "_Solution__value_map" in gimme_instance.sol.__dict__:
-                    solution = gimme_instance.sol.__dict__["_Solution__value_map"]
+                    raw_solution = gimme_instance.sol.__dict__["_Solution__value_map"]
                 elif hasattr(gimme_instance.sol, "value_map"):
-                    solution = gimme_instance.sol.value_map
+                    raw_solution = gimme_instance.sol.value_map
                 elif hasattr(gimme_instance.sol, "fluxes"):
-                    solution = gimme_instance.sol.fluxes
+                    raw_solution = gimme_instance.sol.fluxes
                 else:
                     print("Available sol attributes:", dir(gimme_instance.sol))
                     raise AttributeError(
@@ -510,13 +780,32 @@ def gimme_worker(
                 if hasattr(gimme_instance, "gm") and hasattr(
                     gimme_instance.gm, "solution"
                 ):
-                    solution = gimme_instance.gm.solution
+                    raw_solution = gimme_instance.gm.solution
                 else:
                     raise AttributeError("No alternative solution access found")
             except Exception as alt_err:
                 print(f"Alternative solution access also failed: {alt_err}")
                 raise
 
+        # Convert solution to the expected dictionary format if needed
+        if (
+            isinstance(raw_solution, list)
+            and raw_solution
+            and isinstance(raw_solution[0], tuple)
+        ):
+            # Solution is a list of tuples (reaction_id, flux_value)
+            # Convert to dictionary mapping reaction index to flux value
+            solution = {}
+            for i, (rxn_id, flux_value) in enumerate(raw_solution):
+                solution[f"R{i}"] = flux_value
+        elif isinstance(raw_solution, dict):
+            # Solution is already a dictionary, use as is
+            solution = raw_solution
+        else:
+            # Assume it's an array-like object
+            solution = {f"R{i}": float(val) for i, val in enumerate(raw_solution)}
+
+        print(solution)
         net_solution = recombine_solution(
             solution, original_rxn_ids, split_mapping, reaction_ids_modified
         )
@@ -650,51 +939,33 @@ def gimme_parallel(model, expressionRxns, exchange_reactions, num_workers=2):
                 all_solutions[:, sample_idx] = np.zeros(expressionRxns.shape[0])
                 print(f"Warning: Sample {sample_idx + 1} failed, filled with zeros.")
     else:
-        # Multi-processor: use ProcessPoolExecutor
-        print(f"Running GIMME in multi-threaded mode with {num_workers} workers.")
+        # Multi-processor: use ProcessPoolExecutor with per-worker model initialization and batching
+        print(
+            f"Running GIMME in multi-threaded mode with {num_workers} workers (batched)."
+        )
 
         # Create a spawn-based multiprocessing context
         ctx = multiprocessing.get_context("spawn")
 
-        # Save the modified model to an SBML file so each worker CAN load a fresh copy.
-        modified_model_sbml = os.path.join(
-            project_root, "files", "modified_model_for_parallel.sbml"
+        # Save the modified model to a JSON file once so each worker loads its own copy
+        modified_model_json = os.path.join(
+            project_root, "files", "modified_model_for_parallel.json"
         )
-
-        use_sbml = False
         try:
-            cobra.io.write_sbml_model(model, modified_model_sbml)
-            try:
-                valid_model, sbml_errors = cobra.io.sbml.validate_sbml_model(
-                    modified_model_sbml
-                )
-                if sbml_errors:
-                    print("SBML validation reported errors:", sbml_errors)
-                    raise Exception("SBML validation failed")
-                else:
-                    use_sbml = True
-                    print(f"Wrote and validated SBML model at {modified_model_sbml}")
-            except Exception as ve:
-                print(f"SBML validation failed: {ve}")
+            cobra.io.save_json_model(model, modified_model_json)
+            print(f"JSON model written for workers: {modified_model_json}")
         except Exception as write_err:
-            print(f"Failed to write SBML model to {modified_model_sbml}: {write_err}")
-
-        if not use_sbml:
+            print(f"Failed to write JSON model to {modified_model_json}: {write_err}")
+            # If JSON write fails, fall back to single-threaded to keep correctness
             print(
-                "Falling back to passing deep-copied model objects to workers (no SBML)."
+                "Falling back to single-threaded execution due to JSON write failure."
             )
-
-        # Parallelize over samples using ProcessPoolExecutor.
-        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
-
-            # Submit a job for each sample (limited to the first 10 samples for debugging).
-            futures = {
-                executor.submit(
-                    gimme_worker,
+            for sample_idx in range(expressionRxns.shape[1]):
+                sample_idx, net_solution = gimme_worker(
                     sample_idx,
                     expressionRxns[:, sample_idx],
                     original_rxn_ids,
-                    (modified_model_sbml if use_sbml else copy.deepcopy(model)),
+                    copy.deepcopy(model),
                     reaction_ids_modified,
                     metabolite_ids,
                     split_mapping,
@@ -704,20 +975,55 @@ def gimme_parallel(model, expressionRxns, exchange_reactions, num_workers=2):
                     objectives,
                     obj_frac,
                     flux_threshold,
-                ): sample_idx
-                for sample_idx in range(min(10, expressionRxns.shape[1]))
-            }
-
-            # Collect results as they complete.
-            for future in futures:
-                sample_idx, net_solution = future.result()
+                )
                 if net_solution is not None:
                     all_solutions[:, sample_idx] = net_solution
                 else:
-                    all_solutions[:, sample_idx] = np.zeros(expressionRxns.shape[0])
-                    print(
-                        f"Warning: Sample {sample_idx + 1} failed, filled with zeros."
-                    )
+                    all_solutions[:, sample_idx] = 0.0
+            # Proceed to save and return
+            output_file = os.path.join(
+                project_root, "files", "allsolutions_gimme_parallel.csv"
+            )
+            pd.DataFrame(all_solutions).to_csv(output_file, index=False, header=False)
+            model.objective = original_objective
+            return output_file
+
+        # Configure batching
+        total_samples = expressionRxns.shape[1]
+        # Choose a batch size that gives each worker several samples; simple heuristic
+        batch_size = max(1, int(np.ceil(total_samples / (num_workers * 2))))
+        indices = list(range(total_samples))
+        batches = [
+            indices[i : i + batch_size] for i in range(0, total_samples, batch_size)
+        ]
+
+        # Submit batch jobs with per-process initializer
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(
+                modified_model_json,
+                split_mapping,
+                original_rxn_ids,
+                "MAR13082",  # biomass_rxn_id
+                "MAR03964",  # atpase_rxn_id
+                0.1,  # biomass weight
+                0.9,  # atpase weight
+                obj_frac,
+                flux_threshold,
+            ),
+        ) as executor:
+            futures = {}
+            for batch in batches:
+                expr_batch = expressionRxns[:, batch]
+                futures[executor.submit(gimme_batch_worker, batch, expr_batch)] = batch
+
+            for future in futures:
+                batch_indices, batch_solutions = future.result()
+                # Place batch solutions into the correct columns in all_solutions
+                for col_idx, global_idx in enumerate(batch_indices):
+                    all_solutions[:, global_idx] = batch_solutions[:, col_idx]
 
     # Save the aggregated solutions.
     output_file = os.path.join(project_root, "files", "allsolutions_gimme_parallel.csv")
